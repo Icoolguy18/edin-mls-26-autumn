@@ -44,6 +44,17 @@ __global__ void rmsnorm_kernel(const float* x, const float* weight, float* y, in
   // RMSNorm of this row: y = x / sqrt(mean(x^2) + eps) * weight.
   // YOUR CODE HERE
   // ============================================================
+  float sum = 0.0f;
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    sum += xr[c] * xr[c];
+  }
+
+  float mean_square = block_reduce_sum(sum) / cols;
+  float inv_rms = rsqrtf(mean_square + eps);
+
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    yr[c] = xr[c] * inv_rms * weight[c];
+  }
 }
 
 // Softmax over each row: y = exp(x - max) / sum(exp(x - max)).
@@ -60,11 +71,28 @@ __global__ void softmax_kernel(const float* x, float* y, int cols) {
   // reading x only once, with MaxSum.
   // YOUR CODE HERE
   // ============================================================
+  MaxSum local = {-INFINITY, 0.0f};
+
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    MaxSum value = {xr[c], 1.0f};
+    local = maxsum_merge(local, value);
+  }
 
   // ======================== BLANK 2.7 =========================
   // Pass 2: y = exp(x - row_max) / row_sum.
   // YOUR CODE HERE
   // ============================================================
+  row_max = block_reduce_max(local.m);
+
+  float scaled_sum = 0.0f;
+  if (local.l > 0.0f) {
+    scaled_sum = local.l * expf(local.m - row_max);
+  }
+
+  row_sum = block_reduce_sum(scaled_sum);
+  for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    yr[c] = expf(xr[c] - row_max) / row_sum;
+  }
 }
 
 ASR_API int launch_rmsnorm(const float* x, const float* weight, float* y, int rows,

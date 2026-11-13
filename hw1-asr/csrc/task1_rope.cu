@@ -36,6 +36,10 @@ __global__ void rope_kernel(float* q, float* k, const float* inv_freq, int seq_l
   // (q_pairs + k_pairs in total) do nothing.
   // YOUR CODE HERE
   // ============================================================
+  idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= q_pairs + k_pairs){
+      return;
+  }
 
   float* x = q;               // the tensor this thread works on
   int num_heads = num_q_heads;
@@ -44,6 +48,11 @@ __global__ void rope_kernel(float* q, float* k, const float* inv_freq, int seq_l
   // tensor this thread works on, with idx counting from 0 inside it.
   // YOUR CODE HERE
   // ============================================================
+    if (idx >= q_pairs){
+        x = k;
+        num_heads = num_k_heads;
+        idx -= q_pairs;
+    }
 
   int row = 0;  // which row (one head of one token) of x
   int i = 0;    // which pair inside that row, 0 .. half-1
@@ -52,12 +61,24 @@ __global__ void rope_kernel(float* q, float* k, const float* inv_freq, int seq_l
   // Set row, i (the pair inside the row) and pos (the token position of the row).
   // YOUR CODE HERE
   // ============================================================
+  row = idx / half;
+  i = idx % half;
+  pos = (row / num_heads) % seq_len;
 
   float* v = x + static_cast<size_t>(row) * head_dim;  // start of this row
   // ======================== BLANK 1.4 =========================
   // Rotate the pair (v[i], v[i + half]) in place.
   // YOUR CODE HERE
   // ============================================================
+  float angle = pos * inv_freq[i];
+  float c = cosf(angle);
+  float s = sinf(angle);
+
+  float a = v[i];
+  float b = v[i + half];
+
+  v[i] = a * c - b * s;
+  v[i + half] = b * c + a * s;
 }
 
 ASR_API int launch_rope(float* q, float* k, const float* inv_freq, int batch, int seq_len,
