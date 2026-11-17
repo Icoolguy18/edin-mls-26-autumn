@@ -11,7 +11,13 @@
 #include "asr_kernels.h"
 #include "task2_reduce.cuh"
 
-constexpr int REDUCE_THREADS = 256;  // threads per block: a multiple of 32, at most 1024
+// [AI-assisted change: Claude (Anthropic), 16 Nov 2026] Build-time override so the
+// "Try this 1: 32, 64, 128, 512, 1024" sweep needs no source edit, e.g. NVCCFLAGS="... -DASR_REDUCE_THREADS=...".
+// Without the flag the value is 256, exactly as before; the kernel is unchanged.
+#ifndef ASR_REDUCE_THREADS
+#define ASR_REDUCE_THREADS 256
+#endif
+constexpr int REDUCE_THREADS = ASR_REDUCE_THREADS;  // threads per block: a multiple of 32, at most 1024
 
 // Worked example. LayerNorm: y = (x - mean) / sqrt(var + eps) * weight + bias
 __global__ void layernorm_kernel(const float* x, const float* weight, const float* bias,

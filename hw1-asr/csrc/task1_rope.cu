@@ -21,7 +21,13 @@
 #include "asr_kernels.h"
 #include "common.cuh"
 
-constexpr int ROPE_THREADS = 256;
+// [AI-assisted change: Claude (Anthropic), 16 Nov 2026] Build-time override so the
+// "Try this 1: 32, 64, 128, 512, 1024" sweep needs no source edit, e.g. NVCCFLAGS="... -DASR_ROPE_THREADS=...".
+// Without the flag the value is 256, exactly as before; the kernel is unchanged.
+#ifndef ASR_ROPE_THREADS
+#define ASR_ROPE_THREADS 256
+#endif
+constexpr int ROPE_THREADS = ASR_ROPE_THREADS;
 
 __global__ void rope_kernel(float* q, float* k, const float* inv_freq, int seq_len,
                             int num_q_heads, int num_k_heads, int q_rows, int k_rows,
