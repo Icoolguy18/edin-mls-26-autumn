@@ -25,6 +25,7 @@
 //   -DASR_TILE=8|16|32     tile size of the original kernel ("Try this" 1)
 //   -DASR_GEMM_IMPL=0      use ONLY the original tiled kernel (the baseline)
 //   -DASR_GEMM_IMPL=1      default: shape-based dispatch to the optimised kernels
+//   -DASR_GEMM_IMPL=2      as 1, plus linear_bigtile_kernel for large M (19 Nov)
 //   -DASR_GEMM_MIN_BLOCKS_PER_SM=N  tallest register tile that still gives N blocks per SM
 // Defaults reproduce the measured baseline when ASR_GEMM_IMPL=0.
 // ---------------------------------------------------------------------------------
@@ -326,6 +327,152 @@ linear_smallm_kernel(const float* __restrict__ x, const float* __restrict__ w,
   }
 }
 
+// ---- (c) 128 x 128 register tile with float4 loads, for large M --------------------
+// [AI-assisted optimisation: Claude (Anthropic), 19 Nov 2026]
+//
+// Why: linear_regtile_kernel<4> reaches ~48% of cuBLAS on the encoder shapes
+// (5.1 vs 10.6-12.0 TFLOP/s, RTX 5070 Laptop, 16 Nov). Per K step it still pays for
+//   1. scalar global loads (8 per thread per 16-deep K step of the 64 x 64 tile),
+//   2. 8 shared-memory loads per 16 multiply-adds (4 x 4 outputs per thread), and
+//   3. two __syncthreads(), with no overlap between loading a tile and using it.
+// -> linear_bigtile_kernel:
+//   - covers 128 x 128 outputs per block, 8 x 8 per thread: 4 float4 shared loads
+//     feed 64 multiply-adds (8x fewer shared load instructions per FMA than (a));
+//   - x and w are both K-contiguous, so each thread loads ONE float4 of each tile;
+//   - double-buffers shared memory: the next tile is read into registers while the
+//     current one is used, then stored into the other buffer, so there is one
+//     __syncthreads() per K step.
+// Thread (ty, tx) owns rows {4 ty .. 4 ty + 3} and {64 + 4 ty .. 64 + 4 ty + 3}, and
+// the same pattern of columns with tx. A warp's float4 reads of ws then cover 256
+// contiguous bytes (no bank conflicts) and its reads of xs are broadcasts.
+//
+// Correctness notes:
+//   - every output still adds its K terms in the order k = 0, 1, ..., K-1, like (a)
+//     and the original kernel; same zero padding, same epilogue (bias, then GELU);
+//   - used only when K % 4 == 0 and x, w are 16-byte aligned (float4 loads), and only
+//     when 128-row and 128-column tiles add no padding beyond 64-row/column ones
+//     (see launch_linear). Then k0 + 4 <= K whenever k0 < K, so one bounds check per
+//     float4 is enough;
+//   - y is written with float4 only when N % 4 == 0 and y is 16-byte aligned.
+// Enabled with -DASR_GEMM_IMPL=2 until it has been measured on a GPU.
+// ---------------------------------------------------------------------------------
+constexpr int BT_BM = 128;            // output rows per block
+constexpr int BT_BN = 128;            // output columns per block (load mapping below needs BM == BN)
+constexpr int BT_BK = 8;              // K step staged in shared memory per iteration
+constexpr int BT_TM = 8;              // output rows per thread (two groups of 4)
+constexpr int BT_TN = 8;              // output columns per thread (two groups of 4)
+constexpr int BT_DIM = 16;            // threads per block side: 16 x 16 = 256 threads
+constexpr int BT_THREADS = BT_DIM * BT_DIM;
+constexpr int BT_PITCH = BT_BM + 4;   // +4: transposed stores hit different banks, rows stay 16-byte aligned
+static_assert(BT_BM == BT_BN && BT_BM * BT_BK == 4 * BT_THREADS,
+              "each thread loads exactly one float4 of the x tile and one of the w tile");
+
+// One float4 of a [rows, K] matrix (x or w), or zeros outside it.
+__device__ __forceinline__ float4 bt_load(const float* __restrict__ a, int rows, int K,
+                                          int r, int k) {
+  return (r < rows && k < K)
+             ? __ldg(reinterpret_cast<const float4*>(a + static_cast<size_t>(r) * K + k))
+             : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+}
+
+// Store a float4 holding k .. k+3 of row r into a K-major tile s[k][r].
+__device__ __forceinline__ void bt_store(float (*s)[BT_PITCH], int r, int k, float4 v) {
+  s[k][r] = v.x;
+  s[k + 1][r] = v.y;
+  s[k + 2][r] = v.z;
+  s[k + 3][r] = v.w;
+}
+
+__global__ void __launch_bounds__(BT_THREADS)
+linear_bigtile_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                      const float* __restrict__ bias, float* __restrict__ y,
+                      int M, int N, int K, int act, int vec_y) {
+  // Two buffers per operand, stored K-major ([k][m] and [k][n]) like (a).
+  __shared__ __align__(16) float xs[2][BT_BK][BT_PITCH];
+  __shared__ __align__(16) float ws[2][BT_BK][BT_PITCH];
+
+  const int tid = threadIdx.x;
+  const int tx = tid % BT_DIM;
+  const int ty = tid / BT_DIM;
+  const int row0 = blockIdx.y * BT_BM;
+  const int col0 = blockIdx.x * BT_BN;
+  const int lr = tid / 2;        // the tile row (of x and of w) this thread loads
+  const int lk = (tid % 2) * 4;  // and the first of its 4 K positions
+
+  float acc[BT_TM][BT_TN];
+#pragma unroll
+  for (int i = 0; i < BT_TM; ++i)
+#pragma unroll
+    for (int j = 0; j < BT_TN; ++j) acc[i][j] = 0.0f;
+
+  // First tile into buffer 0.
+  float4 xv = bt_load(x, M, K, row0 + lr, lk);
+  float4 wv = bt_load(w, N, K, col0 + lr, lk);
+  bt_store(xs[0], lr, lk, xv);
+  bt_store(ws[0], lr, lk, wv);
+  __syncthreads();
+
+  int buf = 0;
+  for (int k0 = 0; k0 < K; k0 += BT_BK) {
+    // Start reading the next tile; it is only needed after the loop below.
+    const bool has_next = k0 + BT_BK < K;
+    if (has_next) {
+      xv = bt_load(x, M, K, row0 + lr, k0 + BT_BK + lk);
+      wv = bt_load(w, N, K, col0 + lr, k0 + BT_BK + lk);
+    }
+
+    // Outer product in registers: 4 float4 shared loads feed 64 multiply-adds.
+#pragma unroll
+    for (int kk = 0; kk < BT_BK; ++kk) {
+      const float4 a0 = *reinterpret_cast<const float4*>(&xs[buf][kk][4 * ty]);
+      const float4 a1 = *reinterpret_cast<const float4*>(&xs[buf][kk][64 + 4 * ty]);
+      const float4 b0 = *reinterpret_cast<const float4*>(&ws[buf][kk][4 * tx]);
+      const float4 b1 = *reinterpret_cast<const float4*>(&ws[buf][kk][64 + 4 * tx]);
+      const float a[BT_TM] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+      const float b[BT_TN] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+#pragma unroll
+      for (int i = 0; i < BT_TM; ++i)
+#pragma unroll
+        for (int j = 0; j < BT_TN; ++j) acc[i][j] += a[i] * b[j];
+    }
+
+    // The other buffer was last read before the previous __syncthreads(), so it can
+    // be overwritten now, while slower warps still read this one.
+    if (has_next) {
+      bt_store(xs[buf ^ 1], lr, lk, xv);
+      bt_store(ws[buf ^ 1], lr, lk, wv);
+    }
+    __syncthreads();  // reached by every thread: no early returns in this kernel
+    buf ^= 1;
+  }
+
+  // Epilogue, identical in meaning to BLANK 3.4. Half-warps write 256 contiguous bytes.
+#pragma unroll
+  for (int i = 0; i < BT_TM; ++i) {
+    const int row = row0 + (i < 4 ? 4 * ty + i : 64 + 4 * ty + (i - 4));
+    if (row >= M) continue;
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {  // the two groups of 4 columns
+      const int col = col0 + 64 * h + 4 * tx;
+      float v[4];
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        v[c] = acc[i][4 * h + c];
+        if (bias != nullptr && col + c < N) v[c] += bias[col + c];
+        if (act == ACT_GELU) v[c] = gelu(v[c]);
+      }
+      float* y_row = y + static_cast<size_t>(row) * N;
+      if (vec_y && col + 3 < N) {
+        *reinterpret_cast<float4*>(y_row + col) = make_float4(v[0], v[1], v[2], v[3]);
+      } else {
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+          if (col + c < N) y_row[col + c] = v[c];
+      }
+    }
+  }
+}
+
 // [AI-assisted] Number of SMs of the current GPU, looked up once. Used only to choose
 // a row-block height that still gives every SM some blocks to work on.
 static int gemm_num_sms() {
@@ -349,6 +496,14 @@ static void launch_smallm(const float* x, const float* w, const float* bias, flo
     linear_smallm_kernel<MR, true><<<grid, block, 0, stream>>>(x, w, bias, y, M, N, K, act);
   else
     linear_smallm_kernel<MR, false><<<grid, block, 0, stream>>>(x, w, bias, y, M, N, K, act);
+}
+
+// [AI-assisted] Launch (c). vec_y: N % 4 == 0 and y 16-byte aligned (float4 stores).
+static void launch_bigtile(const float* x, const float* w, const float* bias, float* y,
+                           int M, int N, int K, int act, cudaStream_t stream) {
+  const int vec_y = (N % 4 == 0) && (reinterpret_cast<uintptr_t>(y) % 16 == 0);
+  dim3 grid(ceil_div(N, BT_BN), ceil_div(M, BT_BM));
+  linear_bigtile_kernel<<<grid, BT_THREADS, 0, stream>>>(x, w, bias, y, M, N, K, act, vec_y);
 }
 
 template <int TM>
@@ -381,6 +536,18 @@ ASR_API int launch_linear(const float* x, const float* w, const float* bias, flo
     // leave most SMs idle.
     const int min_blocks = ASR_GEMM_MIN_BLOCKS_PER_SM * gemm_num_sms();
     const int col_blocks = ceil_div(N, RT_BN);
+#if ASR_GEMM_IMPL >= 2
+    // [AI-assisted] 128 x 128 tiles for large M (the encoder), under three conditions:
+    // float4 loads are possible, the tiles add no padding beyond 64-row/column ones
+    // (M = 1500: 12 x 128 vs 24 x 64 rows), and the grid still has min_blocks blocks.
+    const bool vec = (K % 4 == 0) && (reinterpret_cast<uintptr_t>(x) % 16 == 0) &&
+                     (reinterpret_cast<uintptr_t>(w) % 16 == 0);
+    const bool no_extra_pad = 2 * ceil_div(M, BT_BM) == ceil_div(M, 64) &&
+                              2 * ceil_div(N, BT_BN) == ceil_div(N, 64);
+    if (vec && no_extra_pad && ceil_div(M, BT_BM) * ceil_div(N, BT_BN) >= min_blocks)
+      launch_bigtile(x, w, bias, y, M, N, K, act, stream);
+    else
+#endif
     if (ceil_div(M, RT_DIM * 4) * col_blocks >= min_blocks)
       launch_regtile<4>(x, w, bias, y, M, N, K, act, stream);
     else if (ceil_div(M, RT_DIM * 2) * col_blocks >= min_blocks)
