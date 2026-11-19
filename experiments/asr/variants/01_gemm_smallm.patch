@@ -1,0 +1,179 @@
+--- a/task3_gemm.cu
++++ b/task3_gemm.cu
+@@ -13,8 +13,11 @@
+ // computes y[row][col] with row = blockIdx.y*TILE + ty, col = blockIdx.x*TILE + tx.
+ // The block walks along K one tile at a time, staging a tile of x and a tile of w
+ // in shared memory so every loaded value is used TILE times.
++#include <cstdint>
++
+ #include "asr_kernels.h"
+ #include "common.cuh"
++#include "task2_reduce.cuh"  // warp_reduce_sum for the small-M kernel
+ 
+ constexpr int TILE = 16;  // try 8 or 32 (32 x 32 = 1024 threads, the maximum per block)
+ 
+@@ -83,10 +86,161 @@
+   }
+ }
+ 
++// [Cherry-picked from branch CUDA-test (c93c419), linear_smallm_kernel for M <= 8 (TODO 3); 17 Nov 2026.]
++// =================================================================================
++// [AI-assisted optimisation: Claude (Anthropic), 16 Nov 2026]
++//
++// Why: the all-CUDA profile (H200 MIG 1g.18gb) spends 4,966 of 5,691 ms in `linear`.
++// The tiled kernel above has two separate bottlenecks, one per kind of shape:
++//
++//   (a) Large M (audio encoder, decoder prefill). Each thread computes ONE output, so
++//       its inner loop does two shared-memory loads per multiply-add
++//       (xs[ty][k] and ws[tx][k]). Shared-memory bandwidth, not arithmetic, limits it:
++//       ~930 GFLOP/s against cuBLAS's ~6,170 on encoder fc1.
++//       -> linear_regtile_kernel: each thread computes a TM x 4 block of outputs held
++//          in registers, so every value loaded from shared memory is reused TM or 4
++//          times (0.5 loads per multiply-add with TM = 4, instead of 2).
++//
++//   (b) Small M (token-by-token decoding: M = 1). With 16 x 16 blocks only the ty = 0
++//       row has a real output, so 15/16 of the threads do padding work. lm_head reads
++//       its 485 MB weight matrix at ~119 GB/s, about 21% of the slice's ~563 GB/s.
++//       At M = 1 the job is to stream w once, as fast as possible.
++//       -> linear_smallm_kernel: one warp streams SM_COLS rows of w with coalesced
++//          float4 loads, keeps one partial sum per (row of x, column) in registers,
++//          and combines the 32 lanes with warp_reduce_sum (task 2) at the end.
++//
++// Correctness notes:
++//   - Both kernels zero-pad exactly like the original, apply the same epilogue (bias,
++//     then GELU) and write each output once.
++//   - linear_regtile_kernel adds the K terms of every output in the same order as
++//     the original kernel (k = 0, 1, ..., K-1), so results should match it closely.
++//   - linear_smallm_kernel sums in a different order (32 strided partial sums, then
++//     a tree), so its rounding differs slightly from a sequential loop. The tests'
++//     tolerance (1e-3 absolute and relative) is far above float32 rounding at these K.
++//   - float4 loads are used only when K % 4 == 0 and both x and w are 16-byte
++//     aligned. Otherwise a scalar version of the same kernel runs (e.g. K = 7, 33, 129).
++//   - No library calls: everything below is plain CUDA, as the rules require.
++// =================================================================================
++
++// ---- (b) weight-streaming kernel for small M (decoding) ---------------------------
++constexpr int SM_MAX_M = 8;  // M at or below this uses the small-M kernel
++constexpr int SM_COLS = 4;   // columns (rows of w) per warp: each x load is reused 4 times
++constexpr int SM_WARPS = 4;  // warps per block (128 threads)
++
++// MR = compile-time upper bound on M (1, 2, 4 or 8) so acc[MR][SM_COLS] stays in
++// registers. VEC selects float4 loads (needs K % 4 == 0 and 16-byte alignment).
++// There is no __syncthreads() in this kernel, so a warp may return early.
++template <int MR, bool VEC>
++__global__ void __launch_bounds__(SM_WARPS * WARP_SIZE)
++linear_smallm_kernel(const float* __restrict__ x, const float* __restrict__ w,
++                     const float* __restrict__ bias, float* __restrict__ y,
++                     int M, int N, int K, int act) {
++  const int lane = threadIdx.x % WARP_SIZE;
++  const int warp = threadIdx.x / WARP_SIZE;
++  const int n0 = (blockIdx.x * SM_WARPS + warp) * SM_COLS;  // first column of this warp
++  if (n0 >= N) return;                                      // whole warp leaves together
++
++  float acc[MR][SM_COLS];
++#pragma unroll
++  for (int m = 0; m < MR; ++m)
++#pragma unroll
++    for (int c = 0; c < SM_COLS; ++c) acc[m][c] = 0.0f;
++
++  if (VEC) {
++    // Lane l reads float4 number l, l + 32, ... of each row: one warp covers 512
++    // contiguous bytes of a row of w per step, so the loads are fully coalesced.
++    const int K4 = K / 4;
++    const float4* x4 = reinterpret_cast<const float4*>(x);
++    const float4* w4 = reinterpret_cast<const float4*>(w);
++    for (int k4 = lane; k4 < K4; k4 += WARP_SIZE) {
++      float4 wv[SM_COLS];
++#pragma unroll
++      for (int c = 0; c < SM_COLS; ++c) {
++        const int n = n0 + c;
++        wv[c] = (n < N) ? __ldg(&w4[static_cast<size_t>(n) * K4 + k4])
++                        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++      }
++#pragma unroll
++      for (int m = 0; m < MR; ++m) {
++        if (m >= M) break;
++        const float4 xv = __ldg(&x4[static_cast<size_t>(m) * K4 + k4]);
++#pragma unroll
++        for (int c = 0; c < SM_COLS; ++c) {
++          acc[m][c] += xv.x * wv[c].x;
++          acc[m][c] += xv.y * wv[c].y;
++          acc[m][c] += xv.z * wv[c].z;
++          acc[m][c] += xv.w * wv[c].w;
++        }
++      }
++    }
++  } else {
++    // Scalar version of the same loop, for odd K or unaligned pointers.
++    for (int k = lane; k < K; k += WARP_SIZE) {
++      float wv[SM_COLS];
++#pragma unroll
++      for (int c = 0; c < SM_COLS; ++c) {
++        const int n = n0 + c;
++        wv[c] = (n < N) ? __ldg(&w[static_cast<size_t>(n) * K + k]) : 0.0f;
++      }
++#pragma unroll
++      for (int m = 0; m < MR; ++m) {
++        if (m >= M) break;
++        const float xv = __ldg(&x[static_cast<size_t>(m) * K + k]);
++#pragma unroll
++        for (int c = 0; c < SM_COLS; ++c) acc[m][c] += xv * wv[c];
++      }
++    }
++  }
++
++  // Combine the 32 lanes' partial sums (warp_reduce_sum from task 2 leaves the total
++  // in every lane), then lane 0 applies the epilogue and stores.
++#pragma unroll
++  for (int m = 0; m < MR; ++m)
++#pragma unroll
++    for (int c = 0; c < SM_COLS; ++c) acc[m][c] = warp_reduce_sum(acc[m][c]);
++
++  if (lane == 0) {
++#pragma unroll
++    for (int m = 0; m < MR; ++m) {
++      if (m >= M) break;
++#pragma unroll
++      for (int c = 0; c < SM_COLS; ++c) {
++        const int n = n0 + c;
++        if (n >= N) continue;
++        float v = acc[m][c];
++        if (bias != nullptr) v += bias[n];
++        if (act == ACT_GELU) v = gelu(v);
++        y[static_cast<size_t>(m) * N + n] = v;
++      }
++    }
++  }
++}
++
++template <int MR>
++static void launch_smallm(const float* x, const float* w, const float* bias, float* y,
++                          int M, int N, int K, int act, bool vec, cudaStream_t stream) {
++  dim3 grid(ceil_div(N, SM_WARPS * SM_COLS));
++  dim3 block(SM_WARPS * WARP_SIZE);
++  if (vec)
++    linear_smallm_kernel<MR, true><<<grid, block, 0, stream>>>(x, w, bias, y, M, N, K, act);
++  else
++    linear_smallm_kernel<MR, false><<<grid, block, 0, stream>>>(x, w, bias, y, M, N, K, act);
++}
++
+ ASR_API int launch_linear(const float* x, const float* w, const float* bias, float* y,
+                           int M, int N, int K, int act, cudaStream_t stream) {
+-  dim3 block(TILE, TILE);
+-  dim3 grid(ceil_div(N, TILE), ceil_div(M, TILE));
+-  linear_tiled_kernel<<<grid, block, 0, stream>>>(x, w, bias, y, M, N, K, act);
++  // [Cherry-picked] Shape-based dispatch; the C signature is unchanged.
++  if (M <= SM_MAX_M) {
++    const bool vec = (K % 4 == 0) && (reinterpret_cast<uintptr_t>(x) % 16 == 0) &&
++                     (reinterpret_cast<uintptr_t>(w) % 16 == 0);
++    if (M <= 1)      launch_smallm<1>(x, w, bias, y, M, N, K, act, vec, stream);
++    else if (M <= 2) launch_smallm<2>(x, w, bias, y, M, N, K, act, vec, stream);
++    else if (M <= 4) launch_smallm<4>(x, w, bias, y, M, N, K, act, vec, stream);
++    else             launch_smallm<8>(x, w, bias, y, M, N, K, act, vec, stream);
++  } else {
++    dim3 block(TILE, TILE);
++    dim3 grid(ceil_div(N, TILE), ceil_div(M, TILE));
++    linear_tiled_kernel<<<grid, block, 0, stream>>>(x, w, bias, y, M, N, K, act);
++  }
+   RETURN_LAUNCH_ERROR();
+ }
